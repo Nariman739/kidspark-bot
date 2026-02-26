@@ -9,7 +9,7 @@ Architecture:
   3. ESCALATION — notifies manager for bookings/complaints
 """
 
-import json
+import asyncio
 import logging
 import os
 from collections import defaultdict
@@ -51,6 +51,13 @@ logger = logging.getLogger(__name__)
 # ── Conversation Memory ──────────────────────────────────────────────
 conversations: dict[int, list[dict]] = defaultdict(list)
 MAX_HISTORY = 10
+
+# ── Message Batching (debounce) ─────────────────────────────────────
+# Collect multiple rapid messages into one before processing
+DEBOUNCE_SECONDS = 3.0  # Wait 3s after last message
+message_buffers: dict[int, list[str]] = defaultdict(list)
+debounce_tasks: dict[int, asyncio.Task] = {}
+debounce_contexts: dict[int, tuple] = {}  # (update, context) for delayed processing
 
 
 def get_history(chat_id: int) -> list[dict]:
@@ -254,6 +261,43 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Ваш Chat ID: `{chat_id}`", parse_mode="Markdown")
 
 
+async def process_batched_messages(chat_id: int, user, bot_context: ContextTypes.DEFAULT_TYPE):
+    """Process all collected messages after debounce timer expires."""
+    await asyncio.sleep(DEBOUNCE_SECONDS)
+
+    # Grab all buffered messages and clear
+    messages = message_buffers.pop(chat_id, [])
+    debounce_tasks.pop(chat_id, None)
+    debounce_contexts.pop(chat_id, None)
+
+    if not messages:
+        return
+
+    # Combine multiple messages into one
+    combined_text = " ".join(messages)
+    logger.info(f"[{chat_id}] Batched {len(messages)} msg(s): '{combined_text[:80]}'")
+
+    await bot_context.bot.send_chat_action(chat_id, "typing")
+
+    # Step 1: ROUTER — classify message (fast, cheap)
+    category = await route_message(chat_id, combined_text)
+
+    # Step 2: SPECIALIST — generate response (smart, focused KB)
+    result = await specialist_respond(chat_id, combined_text, category)
+
+    # Step 3: Save history
+    add_message(chat_id, "user", combined_text)
+    add_message(chat_id, "assistant", result["response"])
+
+    # Step 4: Send response
+    await bot_context.bot.send_message(chat_id, result["response"])
+
+    # Step 5: Escalate if needed
+    if result["needs_manager"]:
+        await notify_manager(bot_context, chat_id, user, category)
+        logger.info(f"[{chat_id}] Escalated to manager ({category})")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -264,26 +308,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_text:
         return
 
-    logger.info(f"[{chat_id}] {user_text[:80]}")
-    await context.bot.send_chat_action(chat_id, "typing")
+    logger.info(f"[{chat_id}] Received: {user_text[:80]}")
 
-    # Step 1: ROUTER — classify message (fast, cheap)
-    category = await route_message(chat_id, user_text)
+    # Add message to buffer
+    message_buffers[chat_id].append(user_text)
 
-    # Step 2: SPECIALIST — generate response (smart, focused KB)
-    result = await specialist_respond(chat_id, user_text, category)
+    # Cancel previous debounce timer if exists
+    if chat_id in debounce_tasks:
+        debounce_tasks[chat_id].cancel()
 
-    # Step 3: Save history
-    add_message(chat_id, "user", user_text)
-    add_message(chat_id, "assistant", result["response"])
-
-    # Step 4: Send response
-    await update.message.reply_text(result["response"])
-
-    # Step 5: Escalate if needed
-    if result["needs_manager"]:
-        await notify_manager(context, chat_id, user, category)
-        logger.info(f"[{chat_id}] Escalated to manager ({category})")
+    # Start new debounce timer
+    debounce_tasks[chat_id] = asyncio.create_task(
+        process_batched_messages(chat_id, user, context)
+    )
 
 
 # ── Main ─────────────────────────────────────────────────────────────
